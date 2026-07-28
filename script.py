@@ -1,20 +1,19 @@
 import os
 import sys
 import logging
+import smtplib
 from datetime import datetime
+from email.message import EmailMessage
 
 import pandas as pd
-import requests
 import yfinance as yf
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
-SYMBOLS = {
-    "Nifty 50": "^NSEI",
-    "Bank Nifty": "^NSEBANK",
-}
-
+SYMBOL = "^NSEI"
 MIN_MOMENTUM_POINTS = 15
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
 
 
 def get_recent_momentum(symbol: str) -> dict:
@@ -51,40 +50,68 @@ def get_recent_momentum(symbol: str) -> dict:
     }
 
 
-def build_discord_message(momentum: dict) -> str:
-    return (
-        f"**{momentum['symbol']}**\n"
-        f"Live Price: ₹{momentum['current_price']:.2f}\n"
+def build_email(momentum: dict, sender: str, receiver: str) -> EmailMessage:
+    subject = "🚨 F&O AI ALERT: Nifty Momentum Detected"
+    body = (
+        f"Nifty 50 Live Price: ₹{momentum['current_price']:.2f}\n"
         f"Point Change: {momentum['point_change']:+.2f}\n"
-        f"AI Signal: {momentum['ai_signal']}\n"
+        f"Signal: {momentum['ai_signal']}\n"
         f"Trend: {momentum['trend']}\n"
         f"Timestamp: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
     )
 
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = receiver
+    msg.set_content(body)
+    return msg
 
-def send_discord_alert(webhook_url: str, message: str) -> None:
-    payload = {"content": message}
+
+def send_email(sender: str, password: str, receiver: str, message: EmailMessage) -> None:
     try:
-        response = requests.post(webhook_url, json=payload, timeout=15)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Discord webhook post failed: {exc}") from exc
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=30) as smtp:
+            smtp.ehlo()
+            smtp.starttls()
+            smtp.ehlo()
+            smtp.login(sender, password)
+            smtp.send_message(message)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to send email: {exc}") from exc
 
 
 def main() -> int:
-    webhook_url = os.getenv("DISCORD_WEBHOOK")
-    if not webhook_url:
-        logging.error("Missing DISCORD_WEBHOOK environment variable.")
+    sender = os.getenv("SENDER_EMAIL")
+    password = os.getenv("SENDER_PASSWORD")
+    receiver = os.getenv("RECEIVER_EMAIL")
+
+    missing = [name for name, value in (
+        ("SENDER_EMAIL", sender),
+        ("SENDER_PASSWORD", password),
+        ("RECEIVER_EMAIL", receiver),
+    ) if not value]
+
+    if missing:
+        logging.error("Missing environment variables: %s", ", ".join(missing))
         return 1
 
-    for name, symbol in SYMBOLS.items():
-        try:
-            momentum = get_recent_momentum(symbol)
-            message = build_discord_message(momentum)
-            send_discord_alert(webhook_url, message)
-            logging.info("Sent alert for %s: %s", name, momentum)
-        except Exception as exc:
-            logging.error("Skipping %s due to error: %s", name, exc)
+    try:
+        momentum = get_recent_momentum(SYMBOL)
+    except Exception as exc:
+        logging.error("Failed to calculate momentum: %s", exc)
+        return 1
+
+    if momentum["ai_signal"] == "HOLD":
+        logging.info("No momentum alert triggered: %s", momentum)
+        return 0
+
+    email_msg = build_email(momentum, sender, receiver)
+    try:
+        send_email(sender, password, receiver, email_msg)
+        logging.info("Email alert sent to %s", receiver)
+    except Exception as exc:
+        logging.error("Email sending failed: %s", exc)
+        return 1
 
     return 0
 

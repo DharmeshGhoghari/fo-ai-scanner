@@ -33,7 +33,7 @@ async def market_status() -> dict[str, object]:
 
 @router.get("/indices")
 async def market_indices() -> dict[str, list[dict[str, str]]]:
-    """Return index identities until a configured provider supplies observations."""
+    """Return index identities until a configured Upstox provider supplies observations."""
     return {
         "indices": [
             {

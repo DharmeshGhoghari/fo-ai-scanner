@@ -1,7 +1,7 @@
 """Upstox market-data provider adapter.
 
-This module contains provider transport and response normalization only. It does
-not place orders and never returns fabricated market observations.
+Provider transport and normalization are kept separate from FastAPI routes. This
+module never places orders, logs credentials, or fabricates market observations.
 """
 
 from __future__ import annotations
@@ -9,13 +9,15 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeAlias
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote as url_quote
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from app.core.config import settings
 from app.providers.base import MarketDataProvider, ProviderNotConfigured
+
+ProviderRecord: TypeAlias = dict[str, Any]
 
 
 class ProviderRequestError(RuntimeError):
@@ -36,21 +38,22 @@ class ProviderResponseError(ProviderRequestError):
 
 @dataclass(frozen=True)
 class _UpstoxHttpClient:
-    """Small async facade over the standard-library HTTP client."""
+    """Minimal asynchronous HTTP facade using the standard library."""
 
     access_token: str
     timeout: float = 10.0
     base_url: str = "https://api.upstox.com"
 
-    async def get(self, path: str, params: dict[str, str] | None = None) -> dict[str, Any]:
+    async def get(
+        self, path: str, params: dict[str, str] | None = None
+    ) -> dict[str, Any]:
         query = ""
         if params:
             query = "?" + "&".join(
-                f"{url_quote(key)}={url_quote(value)}" for key, value in params.items()
+                f"{quote(key)}={quote(value)}" for key, value in params.items()
             )
-        url = f"{self.base_url}{path}{query}"
         request = Request(
-            url,
+            f"{self.base_url}{path}{query}",
             headers={
                 "Accept": "application/json",
                 "Authorization": f"Bearer {self.access_token}",
@@ -64,9 +67,13 @@ class _UpstoxHttpClient:
                 raise ProviderAuthenticationError("Upstox authentication failed.") from None
             if exc.code == 429:
                 raise ProviderRateLimitError("Upstox rate limit reached.") from None
-            raise ProviderRequestError(f"Upstox request failed with HTTP {exc.code}.") from None
+            raise ProviderRequestError(
+                f"Upstox request failed with HTTP {exc.code}."
+            ) from None
         except (TimeoutError, URLError, OSError):
-            raise ProviderRequestError("Unable to reach the Upstox market-data service.") from None
+            raise ProviderRequestError(
+                "Unable to reach the Upstox market-data service."
+            ) from None
 
         try:
             payload = json.loads(raw)
@@ -84,12 +91,13 @@ class _UpstoxHttpClient:
 class UpstoxProvider(MarketDataProvider):
     """Async adapter for Upstox market-data endpoints.
 
-    ``symbol`` arguments are Upstox instrument keys, such as the keys from the
-    official instrument master. Symbol discovery is intentionally not guessed;
-    callers should supply or maintain that mapping outside this adapter.
+    Symbols are Upstox instrument keys, typically sourced from the official
+    instrument master outside this provider. No symbol mapping is guessed here.
     """
 
     def __init__(self, timeout: float = 10.0) -> None:
+        if timeout <= 0:
+            raise ValueError("Provider timeout must be positive.")
         self._timeout = timeout
 
     def _client(self) -> _UpstoxHttpClient:
@@ -105,63 +113,70 @@ class UpstoxProvider(MarketDataProvider):
             raise ProviderResponseError("Upstox response did not contain an object payload.")
         return data
 
-    async def search(self, query: str) -> list[dict[str, Any]]:
-        """Return provider search results when a supported search endpoint exists.
+    @staticmethod
+    def _validate_symbol(symbol: str) -> str:
+        value = symbol.strip()
+        if not value or len(value) > 200:
+            raise ProviderRequestError("A valid Upstox instrument key is required.")
+        return value
 
-        Upstox instrument discovery is normally performed from its instrument
-        master file. This adapter does not fabricate search results or download
-        and cache that mapping implicitly, so it reports the unconfigured state.
-        """
+    async def search(self, query: str) -> list[ProviderRecord]:
+        """Search configured instruments without fabricating search results."""
         self._client()
         if not query.strip():
             return []
-        raise ProviderRequestError("Upstox instrument-master search is not configured.")
+        raise ProviderRequestError(
+            "Upstox instrument-master search is not configured."
+        )
 
-    async def search_stocks(self, query: str) -> list[dict[str, Any]]:
-        """Search instruments using the provider's configured instrument mapping."""
+    async def search_stocks(self, query: str) -> list[ProviderRecord]:
+        """Search instruments using the configured instrument-master integration."""
         return await self.search(query)
 
-    async def quote(self, symbol: str) -> dict[str, Any]:
+    async def quote(self, symbol: str) -> ProviderRecord:
         """Fetch a quote for an Upstox instrument key."""
         client = self._client()
         payload = await client.get(
             "/v2/market-quote/quotes",
-            {"instrument_key": symbol},
+            {"instrument_key": self._validate_symbol(symbol)},
         )
         return self._data(payload)
 
-    async def get_quote(self, symbol: str) -> dict[str, Any]:
-        """Fetch a quote using an explicit provider-style method name."""
+    async def get_quote(self, symbol: str) -> ProviderRecord:
+        """Fetch a quote using the provider-specific method name."""
         return await self.quote(symbol)
 
-    async def history(self, symbol: str, interval: str) -> list[dict[str, Any]]:
-        """Fetch historical candles for an Upstox instrument key and interval."""
-        client = self._client()
-        parts = interval.split("_")
-        if len(parts) != 2 or parts[0] not in {"1", "5", "10", "15", "30", "60"}:
+    async def history(self, symbol: str, interval: str) -> list[ProviderRecord]:
+        """Fetch historical candles for an Upstox instrument key.
+
+        ``interval`` is expected in Upstox form, for example ``1d`` or ``30m``.
+        The returned records remain provider-shaped for a separate normalizer.
+        """
+        value = interval.strip().lower()
+        if len(value) < 2 or not value[:-1].isdigit() or value[-1] not in {"m", "h", "d", "w"}:
             raise ProviderRequestError("Unsupported Upstox candle interval.")
-        unit, value = parts
+        client = self._client()
         payload = await client.get(
-            f"/v2/historical-candle/{url_quote(symbol, safe='')}/{unit}/{value}",
+            f"/v2/historical-candle/{quote(self._validate_symbol(symbol), safe='')}/{quote(value)}"
         )
-        data = self._data(payload)
-        candles = data.get("candles")
+        candles = self._data(payload).get("candles")
         if not isinstance(candles, list):
             raise ProviderResponseError("Upstox response did not contain candles.")
-        return [candle for candle in candles if isinstance(candle, list)]
+        return [candle for candle in candles if isinstance(candle, dict)]
 
-    async def get_history(self, symbol: str, interval: str) -> list[dict[str, Any]]:
-        """Fetch historical candles using an explicit provider-style method name."""
+    async def get_history(self, symbol: str, interval: str) -> list[ProviderRecord]:
+        """Fetch historical candles using the provider-specific method name."""
         return await self.history(symbol, interval)
 
-    async def get_market_indices(self, instrument_keys: list[str]) -> list[dict[str, Any]]:
-        """Fetch configured index quotes without inventing index identifiers."""
+    async def get_market_indices(
+        self, instrument_keys: list[str]
+    ) -> list[ProviderRecord]:
+        """Fetch quotes for explicitly configured index instrument keys."""
         if not instrument_keys:
             return []
         client = self._client()
-        payload = await client.get(
-            "/v2/market-quote/quotes",
-            {"instrument_key": ",".join(instrument_keys)},
+        keys = [self._validate_symbol(key) for key in instrument_keys]
+        data = self._data(
+            await client.get("/v2/market-quote/quotes", {"instrument_key": ",".join(keys)})
         )
-        data = self._data(payload)
         return [value for value in data.values() if isinstance(value, dict)]
